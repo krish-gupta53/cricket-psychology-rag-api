@@ -4,4 +4,3 @@ openai==1.78.1
 pinecone==7.0.2
 pydantic==2.11.4
 python-dotenv==1.0.1
-orjson==3.10.18
