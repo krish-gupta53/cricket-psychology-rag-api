@@ -2,13 +2,24 @@ import json
 import os
 import hashlib
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Literal, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional
+from operator import add
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from openai import OpenAI
 from pinecone import Pinecone
 
+from langchain_core.messages import HumanMessage, AIMessage, RemoveMessage, SystemMessage
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import MemorySaver
+from typing_extensions import TypedDict
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
 
 class Settings(BaseModel):
     openai_api_key: str
@@ -42,6 +53,10 @@ class Settings(BaseModel):
         )
 
 
+# ---------------------------------------------------------------------------
+# FastAPI request/response models
+# ---------------------------------------------------------------------------
+
 class GenerateContentRequest(BaseModel):
     problem: str = Field(..., min_length=5)
     category: str = Field(..., min_length=2)
@@ -49,7 +64,8 @@ class GenerateContentRequest(BaseModel):
     cricket_role: str = Field(..., min_length=2)
     player_level: str = Field(..., min_length=2)
     psychology_angle: str = Field(..., min_length=2)
-    debug: bool = True
+    thread_id: str = Field(default="default", description="Session thread ID for memory continuity")
+    debug: bool = False
 
 
 class QueryItem(BaseModel):
@@ -128,16 +144,39 @@ class FinalContentResponse(BaseModel):
     source_grounding: SourceGrounding
 
 
-class AppState:
-    settings: Settings
-    openai_client: OpenAI
-    pinecone_client: Pinecone
-    pinecone_index: Any
+# ---------------------------------------------------------------------------
+# LangGraph State
+# ---------------------------------------------------------------------------
 
+class PipelineState(TypedDict):
+    # ── Inputs ──────────────────────────────────────────────────────────────
+    payload: Dict[str, Any]
+
+    # ── Memory: only lives in brief_node (Node 1) ───────────────────────────
+    # Full message history managed by add_messages reducer.
+    # After each run the summarize_brief_memory node trims to last 2 messages
+    # and stores a rolling summary string.
+    messages: Annotated[List[Any], add_messages]
+    brief_summary: str                    # rolling summary of prior brief calls
+
+    # ── Pipeline stage outputs ───────────────────────────────────────────────
+    brief: Optional[Dict[str, Any]]
+    queries: Optional[List[Dict[str, Any]]]
+    raw_chunks: Annotated[List[Dict[str, Any]], add]   # accumulates via reducer
+    selected_chunks: Optional[List[Dict[str, Any]]]
+    angle_selection: Optional[Dict[str, Any]]
+    final_content: Optional[Dict[str, Any]]
+
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
 
 BRIEF_PROMPT = """You are a cricket psychology content strategist.
 
 Your task is to enrich the selected cricket problem into a clear content brief.
+
+{summary_context}
 
 Input:
 
@@ -387,10 +426,42 @@ Writing rules:
 - Return JSON only."""
 
 
-def clean_chunk(match: Any, query_type: str) -> Dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Helper utilities
+# ---------------------------------------------------------------------------
+
+def _parse_llm_json(raw: str) -> Dict[str, Any]:
+    """Strip markdown fences and parse JSON robustly."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[-1]
+        raw = raw.rsplit("```", 1)[0].strip()
+    return json.loads(raw)
+
+
+def _llm_call(client: OpenAI, model: str, prompt: str) -> Dict[str, Any]:
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+        timeout=60,
+    )
+    return _parse_llm_json(response.choices[0].message.content)
+
+
+def _embed_text(client: OpenAI, model: str, text: str) -> List[float]:
+    result = client.embeddings.create(model=model, input=text)
+    return result.data[0].embedding
+
+
+def _clean_chunk(match: Any, query_type: str) -> Dict[str, Any]:
     metadata = getattr(match, "metadata", {}) or {}
     text = metadata.get("text", "")
-    chunk_id = getattr(match, "id", None) or metadata.get("_id") or hashlib.md5(text.encode("utf-8")).hexdigest()
+    chunk_id = (
+        getattr(match, "id", None)
+        or metadata.get("_id")
+        or hashlib.md5(text.encode("utf-8")).hexdigest()
+    )
     return {
         "id": chunk_id,
         "score": float(getattr(match, "score", 0.0) or 0.0),
@@ -410,12 +481,18 @@ def clean_chunk(match: Any, query_type: str) -> Dict[str, Any]:
     }
 
 
-def dedupe_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+# ---------------------------------------------------------------------------
+# Chunk selection (15 raw → 9 selected, diversity-aware)
+# ---------------------------------------------------------------------------
+
+def _dedupe_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen_ids: set = set()
     seen_text: set = set()
     deduped = []
     for chunk in chunks:
-        text_key = hashlib.md5(chunk.get("text", "").strip().lower().encode("utf-8")).hexdigest()
+        text_key = hashlib.md5(
+            chunk.get("text", "").strip().lower().encode("utf-8")
+        ).hexdigest()
         if chunk["id"] in seen_ids or text_key in seen_text:
             continue
         seen_ids.add(chunk["id"])
@@ -424,48 +501,69 @@ def dedupe_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return deduped
 
 
-def normalize_and_rank(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    by_type: Dict[str, List[Dict[str, Any]]] = {}
-    for c in chunks:
-        by_type.setdefault(c["query_type"], []).append(c)
-
+def _normalize_and_rank(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Compute final_rank_score per chunk.
+    Formula: 0.75 * normalized_vector_score
+           + 0.15 * diversity_bonus   (varies by query_type)
+           + 0.10 * source_priority   (capped at 0.10)
+    """
     diversity_bonus_map = {
         "symptom": 0.04,
         "mental_skill": 0.06,
         "deep_psychology": 0.08,
     }
+    by_type: Dict[str, List[Dict[str, Any]]] = {}
+    for c in chunks:
+        by_type.setdefault(c["query_type"], []).append(c)
 
     for query_type, group in by_type.items():
         scores = [g["score"] for g in group]
         max_s, min_s = max(scores), min(scores)
         for g in group:
-            normalized = 1.0 if max_s == min_s else (g["score"] - min_s) / (max_s - min_s)
+            normalized = (
+                1.0 if max_s == min_s else (g["score"] - min_s) / (max_s - min_s)
+            )
             priority_bonus = min(float(g.get("source_priority", 0)) / 100.0, 0.10)
             div_bonus = diversity_bonus_map.get(query_type, 0.04)
             g["normalized_score"] = normalized
-            g["final_rank_score"] = 0.75 * normalized + 0.15 * div_bonus + 0.10 * priority_bonus
-
+            g["final_rank_score"] = (
+                0.75 * normalized + 0.15 * div_bonus + 0.10 * priority_bonus
+            )
     return chunks
 
 
-def select_top_chunks(chunks: List[Dict[str, Any]], final_chunk_count: int = 9) -> List[Dict[str, Any]]:
-    deduped = dedupe_chunks(chunks)
-    ranked = normalize_and_rank(deduped)
+def select_top_chunks(
+    chunks: List[Dict[str, Any]], final_chunk_count: int = 9
+) -> List[Dict[str, Any]]:
+    """
+    Dedup → rank → guarantee diversity (2 per query_type first)
+    → fill remainder by score → cap at final_chunk_count.
+    Operates on the accumulated raw_chunks from PipelineState.
+    """
+    deduped = _dedupe_chunks(chunks)
+    ranked = _normalize_and_rank(deduped)
 
     by_type = {
-        qt: sorted([c for c in ranked if c["query_type"] == qt], key=lambda x: x["final_rank_score"], reverse=True)
+        qt: sorted(
+            [c for c in ranked if c["query_type"] == qt],
+            key=lambda x: x["final_rank_score"],
+            reverse=True,
+        )
         for qt in ["symptom", "mental_skill", "deep_psychology"]
     }
 
-    selected = []
+    selected: List[Dict[str, Any]] = []
     selected_ids: set = set()
 
+    # Guarantee at least 2 from each query type
     for qt in ["symptom", "mental_skill", "deep_psychology"]:
         for chunk in by_type.get(qt, [])[:2]:
             if chunk["id"] not in selected_ids:
                 selected.append(chunk)
                 selected_ids.add(chunk["id"])
 
+    # Fill remaining slots with highest ranked remaining chunks
     remaining = sorted(
         [c for c in ranked if c["id"] not in selected_ids],
         key=lambda x: x["final_rank_score"],
@@ -477,120 +575,259 @@ def select_top_chunks(chunks: List[Dict[str, Any]], final_chunk_count: int = 9) 
         selected.append(chunk)
         selected_ids.add(chunk["id"])
 
-    return sorted(selected, key=lambda x: x["final_rank_score"], reverse=True)[:final_chunk_count]
+    return sorted(selected, key=lambda x: x["final_rank_score"], reverse=True)[
+        :final_chunk_count
+    ]
 
 
-def llm_call(client: OpenAI, model: str, prompt: str) -> Dict[str, Any]:
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
+# ---------------------------------------------------------------------------
+# App-level shared state
+# ---------------------------------------------------------------------------
+
+class AppState:
+    settings: Settings
+    openai_client: OpenAI
+    pinecone_client: Pinecone
+    pinecone_index: Any
+    graph: Any
+    checkpointer: Any
+
+
+_app_state_ref: AppState = None  # set during lifespan
+
+
+def _get_services() -> AppState:
+    return _app_state_ref
+
+
+# ---------------------------------------------------------------------------
+# LangGraph nodes
+# ---------------------------------------------------------------------------
+
+# Node 1 – Brief generation (only node that uses memory)
+def node_brief(state: PipelineState) -> Dict[str, Any]:
+    svc = _get_services()
+    payload = state["payload"]
+
+    summary = state.get("brief_summary", "")
+    summary_context = (
+        f"Context from your previous brief for a related request:\n{summary}\n"
+        if summary
+        else ""
     )
-    raw = response.choices[0].message.content.strip()
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[-1]
-        raw = raw.rsplit("```", 1)[0].strip()
-    return json.loads(raw)
+
+    raw = _llm_call(
+        svc.openai_client,
+        svc.settings.llm_model,
+        BRIEF_PROMPT.format(
+            summary_context=summary_context,
+            problem=payload["problem"],
+            category=payload["category"],
+            sub_category=payload["sub_category"],
+            cricket_role=payload["cricket_role"],
+            player_level=payload["player_level"],
+            psychology_angle=payload["psychology_angle"],
+        ),
+    )
+    brief = BriefResponse.model_validate(raw).model_dump()
+
+    # Record this turn: HumanMessage = input, AIMessage = brief output
+    new_messages = [
+        HumanMessage(content=f"Problem: {payload['problem']}"),
+        AIMessage(content=json.dumps(brief)),
+    ]
+    return {"brief": brief, "messages": new_messages}
 
 
-def embed_text(client: OpenAI, model: str, text: str) -> List[float]:
-    result = client.embeddings.create(model=model, input=text)
-    return result.data[0].embedding
+# Node 1b – Summarize & trim brief memory (keeps last 1 pair = 2 messages)
+def node_summarize_brief_memory(state: PipelineState) -> Dict[str, Any]:
+    svc = _get_services()
+    messages = state.get("messages", [])
+
+    if len(messages) < 2:
+        return {}
+
+    existing_summary = state.get("brief_summary", "")
+    if existing_summary:
+        summary_prompt = (
+            f"Existing summary: {existing_summary}\n\n"
+            f"Extend this summary with the latest exchange:\n"
+            f"User: {messages[-2].content}\nAssistant: {messages[-1].content}"
+        )
+    else:
+        summary_prompt = (
+            f"Summarise this brief generation exchange in 2-3 sentences:\n"
+            f"User: {messages[-2].content}\nAssistant: {messages[-1].content}"
+        )
+
+    response = svc.openai_client.chat.completions.create(
+        model=svc.settings.llm_model,
+        messages=[{"role": "user", "content": summary_prompt}],
+        temperature=0.2,
+        max_tokens=200,
+        timeout=30,
+    )
+    new_summary = response.choices[0].message.content.strip()
+
+    # Delete all messages except the last 2 (most recent Human+AI pair)
+    delete_msgs = [RemoveMessage(id=m.id) for m in messages[:-2]]
+    return {"brief_summary": new_summary, "messages": delete_msgs}
 
 
-def retrieve_all(state: AppState, queries: List[QueryItem]) -> List[Dict[str, Any]]:
+# Node 2 – Query generation
+def node_generate_queries(state: PipelineState) -> Dict[str, Any]:
+    svc = _get_services()
+    payload = state["payload"]
+    brief = state["brief"]
+
+    raw = _llm_call(
+        svc.openai_client,
+        svc.settings.llm_model,
+        QUERY_PROMPT.format(
+            problem=payload["problem"],
+            cricket_role=payload["cricket_role"],
+            player_level=payload["player_level"],
+            psychology_angle=payload["psychology_angle"],
+            category=payload["category"],
+            content_brief=json.dumps(brief, indent=2),
+        ),
+    )
+    queries = QueryGenerationResponse.model_validate(raw).model_dump()["queries"]
+    return {"queries": queries}
+
+
+# Node 3 – Retrieve chunks from Pinecone (all 3 queries)
+def node_retrieve_chunks(state: PipelineState) -> Dict[str, Any]:
+    svc = _get_services()
+    queries = state["queries"]
+
     all_chunks: List[Dict[str, Any]] = []
     for q in queries:
-        vector = embed_text(state.openai_client, state.settings.embedding_model, q.query)
-        result = state.pinecone_index.query(
-            namespace=state.settings.pinecone_namespace,
+        vector = _embed_text(
+            svc.openai_client, svc.settings.embedding_model, q["query"]
+        )
+        result = svc.pinecone_index.query(
+            namespace=svc.settings.pinecone_namespace,
             vector=vector,
-            top_k=state.settings.top_k_per_query,
+            top_k=svc.settings.top_k_per_query,
             include_metadata=True,
         )
-        for match in (getattr(result, "matches", []) or []):
-            all_chunks.append(clean_chunk(match, q.query_type))
-    return all_chunks
+        for match in getattr(result, "matches", []) or []:
+            all_chunks.append(_clean_chunk(match, q["query_type"]))
+
+    return {"raw_chunks": all_chunks}
 
 
-def run_pipeline(state: AppState, payload: GenerateContentRequest) -> Dict[str, Any]:
-    brief = BriefResponse.model_validate(llm_call(
-        state.openai_client, state.settings.llm_model,
-        BRIEF_PROMPT.format(
-            problem=payload.problem, category=payload.category,
-            sub_category=payload.sub_category, cricket_role=payload.cricket_role,
-            player_level=payload.player_level, psychology_angle=payload.psychology_angle,
-        )
-    ))
+# Node 4 – Select top-N chunks (15 → 9, diversity-aware)
+def node_select_chunks(state: PipelineState) -> Dict[str, Any]:
+    selected = select_top_chunks(
+        state["raw_chunks"],
+        state["payload"].get("final_chunk_count", 9),
+    )
+    return {"selected_chunks": selected}
 
-    query_gen = QueryGenerationResponse.model_validate(llm_call(
-        state.openai_client, state.settings.llm_model,
-        QUERY_PROMPT.format(
-            problem=payload.problem, cricket_role=payload.cricket_role,
-            player_level=payload.player_level, psychology_angle=payload.psychology_angle,
-            category=payload.category, content_brief=brief.model_dump_json(indent=2),
-        )
-    ))
 
-    raw_chunks = retrieve_all(state, query_gen.queries)
-    selected_chunks = select_top_chunks(raw_chunks, state.settings.final_chunk_count)
+# Node 5 – Angle selection
+def node_select_angle(state: PipelineState) -> Dict[str, Any]:
+    svc = _get_services()
+    payload = state["payload"]
 
-    angle_selection = AngleSelectionResponse.model_validate(llm_call(
-        state.openai_client, state.settings.llm_model,
+    raw = _llm_call(
+        svc.openai_client,
+        svc.settings.llm_model,
         ANGLE_PROMPT.format(
-            problem=payload.problem, cricket_role=payload.cricket_role,
-            player_level=payload.player_level, psychology_angle=payload.psychology_angle,
-            content_brief=brief.model_dump_json(indent=2),
-            selected_knowledge=json.dumps(selected_chunks, indent=2),
-        )
-    ))
+            problem=payload["problem"],
+            cricket_role=payload["cricket_role"],
+            player_level=payload["player_level"],
+            psychology_angle=payload["psychology_angle"],
+            content_brief=json.dumps(state["brief"], indent=2),
+            selected_knowledge=json.dumps(state["selected_chunks"], indent=2),
+        ),
+    )
+    angle_selection = AngleSelectionResponse.model_validate(raw).model_dump()
+    return {"angle_selection": angle_selection}
 
-    final_content = FinalContentResponse.model_validate(llm_call(
-        state.openai_client, state.settings.llm_model,
+
+# Node 6 – Final content generation
+def node_generate_content(state: PipelineState) -> Dict[str, Any]:
+    svc = _get_services()
+    payload = state["payload"]
+
+    raw = _llm_call(
+        svc.openai_client,
+        svc.settings.llm_model,
         FINAL_PROMPT.format(
-            problem=payload.problem, category=payload.category,
-            sub_category=payload.sub_category, cricket_role=payload.cricket_role,
-            player_level=payload.player_level, psychology_angle=payload.psychology_angle,
-            content_angle=angle_selection.chosen_angle.angle_name,
-            content_brief_json=brief.model_dump_json(indent=2),
-            queries_json=query_gen.model_dump_json(indent=2),
-            selected_chunks_json=json.dumps(selected_chunks, indent=2),
-            chosen_angle_json=angle_selection.model_dump_json(indent=2),
-        )
-    ))
+            problem=payload["problem"],
+            category=payload["category"],
+            sub_category=payload["sub_category"],
+            cricket_role=payload["cricket_role"],
+            player_level=payload["player_level"],
+            psychology_angle=payload["psychology_angle"],
+            content_angle=state["angle_selection"]["chosen_angle"]["angle_name"],
+            content_brief_json=json.dumps(state["brief"], indent=2),
+            queries_json=json.dumps(state["queries"], indent=2),
+            selected_chunks_json=json.dumps(state["selected_chunks"], indent=2),
+            chosen_angle_json=json.dumps(state["angle_selection"], indent=2),
+        ),
+    )
+    final_content = FinalContentResponse.model_validate(raw).model_dump()
+    return {"final_content": final_content}
 
-    response: Dict[str, Any] = {
-        "status": "success",
-        "input": payload.model_dump(),
-        "final_content": final_content.model_dump(),
-    }
-    if payload.debug:
-        response.update({
-            "content_brief": brief.model_dump(),
-            "retrieval_queries": query_gen.model_dump(),
-            "retrieved_candidate_count": len(raw_chunks),
-            "selected_chunks": selected_chunks,
-            "angle_selection": angle_selection.model_dump(),
-        })
-    return response
 
+# ---------------------------------------------------------------------------
+# Build LangGraph
+# ---------------------------------------------------------------------------
+
+def build_graph():
+    builder = StateGraph(PipelineState)
+
+    builder.add_node("brief", node_brief)
+    builder.add_node("summarize_brief_memory", node_summarize_brief_memory)
+    builder.add_node("generate_queries", node_generate_queries)
+    builder.add_node("retrieve_chunks", node_retrieve_chunks)
+    builder.add_node("select_chunks", node_select_chunks)
+    builder.add_node("select_angle", node_select_angle)
+    builder.add_node("generate_content", node_generate_content)
+
+    builder.add_edge(START, "brief")
+    builder.add_edge("brief", "summarize_brief_memory")
+    builder.add_edge("summarize_brief_memory", "generate_queries")
+    builder.add_edge("generate_queries", "retrieve_chunks")
+    builder.add_edge("retrieve_chunks", "select_chunks")
+    builder.add_edge("select_chunks", "select_angle")
+    builder.add_edge("select_angle", "generate_content")
+    builder.add_edge("generate_content", END)
+
+    checkpointer = MemorySaver()
+    return builder.compile(checkpointer=checkpointer), checkpointer
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _app_state_ref
+    from dotenv import load_dotenv
+    load_dotenv()
+
     settings = Settings.from_env()
     state = AppState()
     state.settings = settings
     state.openai_client = OpenAI(api_key=settings.openai_api_key)
     state.pinecone_client = Pinecone(api_key=settings.pinecone_api_key)
     state.pinecone_index = state.pinecone_client.Index(host=settings.pinecone_index_host)
+    state.graph, state.checkpointer = build_graph()
+    _app_state_ref = state
     app.state.services = state
     yield
 
 
 app = FastAPI(
     title="Cricket Psychology RAG API",
-    version="1.0.0",
-    description="4-stage RAG pipeline for cricket psychology content generation.",
+    version="2.0.0",
+    description="LangGraph 6-node RAG pipeline for cricket psychology content generation.",
     lifespan=lifespan,
 )
 
@@ -603,8 +840,39 @@ def health():
 @app.post("/generate-content")
 def generate_content(payload: GenerateContentRequest):
     try:
-        state: AppState = app.state.services
-        return run_pipeline(state, payload)
+        svc: AppState = app.state.services
+        config = {"configurable": {"thread_id": payload.thread_id}}
+
+        initial_state: PipelineState = {
+            "payload": payload.model_dump(),
+            "messages": [],
+            "brief_summary": "",
+            "brief": None,
+            "queries": None,
+            "raw_chunks": [],
+            "selected_chunks": None,
+            "angle_selection": None,
+            "final_content": None,
+        }
+
+        result = svc.graph.invoke(initial_state, config=config)
+
+        response: Dict[str, Any] = {
+            "status": "success",
+            "input": payload.model_dump(),
+            "final_content": result["final_content"],
+        }
+        if payload.debug:
+            response.update({
+                "content_brief": result["brief"],
+                "retrieval_queries": result["queries"],
+                "retrieved_candidate_count": len(result["raw_chunks"]),
+                "selected_chunks": result["selected_chunks"],
+                "angle_selection": result["angle_selection"],
+                "brief_summary_used": result.get("brief_summary", ""),
+            })
+        return response
+
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except json.JSONDecodeError as e:
