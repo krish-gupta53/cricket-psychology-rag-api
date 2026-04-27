@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from openai import OpenAI
 from pinecone import Pinecone
 
-from langchain_core.messages import HumanMessage, AIMessage, RemoveMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage, RemoveMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
@@ -152,12 +152,11 @@ class PipelineState(TypedDict):
     # ── Inputs ──────────────────────────────────────────────────────────────
     payload: Dict[str, Any]
 
-    # ── Memory: only lives in brief_node (Node 1) ───────────────────────────
-    # Full message history managed by add_messages reducer.
-    # After each run the summarize_brief_memory node trims to last 2 messages
-    # and stores a rolling summary string.
+    # ── Memory: scoped to run_brief node only ────────────────────────────────
+    # add_messages reducer merges new messages into the list.
+    # run_memory_summary trims to last 1 pair and maintains brief_summary.
     messages: Annotated[List[Any], add_messages]
-    brief_summary: str                    # rolling summary of prior brief calls
+    brief_summary: str
 
     # ── Pipeline stage outputs ───────────────────────────────────────────────
     brief: Optional[Dict[str, Any]]
@@ -539,7 +538,6 @@ def select_top_chunks(
     """
     Dedup → rank → guarantee diversity (2 per query_type first)
     → fill remainder by score → cap at final_chunk_count.
-    Operates on the accumulated raw_chunks from PipelineState.
     """
     deduped = _dedupe_chunks(chunks)
     ranked = _normalize_and_rank(deduped)
@@ -602,10 +600,12 @@ def _get_services() -> AppState:
 
 # ---------------------------------------------------------------------------
 # LangGraph nodes
+# NOTE: Node names must NOT match any key in PipelineState.
+#       All nodes are prefixed with "run_" to avoid that conflict.
 # ---------------------------------------------------------------------------
 
-# Node 1 – Brief generation (only node that uses memory)
-def node_brief(state: PipelineState) -> Dict[str, Any]:
+# Node: run_brief — generates the content brief; the ONLY node that uses memory
+def node_run_brief(state: PipelineState) -> Dict[str, Any]:
     svc = _get_services()
     payload = state["payload"]
 
@@ -639,8 +639,8 @@ def node_brief(state: PipelineState) -> Dict[str, Any]:
     return {"brief": brief, "messages": new_messages}
 
 
-# Node 1b – Summarize & trim brief memory (keeps last 1 pair = 2 messages)
-def node_summarize_brief_memory(state: PipelineState) -> Dict[str, Any]:
+# Node: run_memory_summary — trims messages to last 1 pair, updates brief_summary
+def node_run_memory_summary(state: PipelineState) -> Dict[str, Any]:
     svc = _get_services()
     messages = state.get("messages", [])
 
@@ -674,11 +674,10 @@ def node_summarize_brief_memory(state: PipelineState) -> Dict[str, Any]:
     return {"brief_summary": new_summary, "messages": delete_msgs}
 
 
-# Node 2 – Query generation
-def node_generate_queries(state: PipelineState) -> Dict[str, Any]:
+# Node: run_queries — generates 3 Pinecone search queries from the brief
+def node_run_queries(state: PipelineState) -> Dict[str, Any]:
     svc = _get_services()
     payload = state["payload"]
-    brief = state["brief"]
 
     raw = _llm_call(
         svc.openai_client,
@@ -689,20 +688,19 @@ def node_generate_queries(state: PipelineState) -> Dict[str, Any]:
             player_level=payload["player_level"],
             psychology_angle=payload["psychology_angle"],
             category=payload["category"],
-            content_brief=json.dumps(brief, indent=2),
+            content_brief=json.dumps(state["brief"], indent=2),
         ),
     )
     queries = QueryGenerationResponse.model_validate(raw).model_dump()["queries"]
     return {"queries": queries}
 
 
-# Node 3 – Retrieve chunks from Pinecone (all 3 queries)
-def node_retrieve_chunks(state: PipelineState) -> Dict[str, Any]:
+# Node: run_retrieval — fetches top_k chunks per query from Pinecone
+def node_run_retrieval(state: PipelineState) -> Dict[str, Any]:
     svc = _get_services()
-    queries = state["queries"]
 
     all_chunks: List[Dict[str, Any]] = []
-    for q in queries:
+    for q in state["queries"]:
         vector = _embed_text(
             svc.openai_client, svc.settings.embedding_model, q["query"]
         )
@@ -718,8 +716,8 @@ def node_retrieve_chunks(state: PipelineState) -> Dict[str, Any]:
     return {"raw_chunks": all_chunks}
 
 
-# Node 4 – Select top-N chunks (15 → 9, diversity-aware)
-def node_select_chunks(state: PipelineState) -> Dict[str, Any]:
+# Node: run_chunk_selection — diversity-aware 15→9 selection
+def node_run_chunk_selection(state: PipelineState) -> Dict[str, Any]:
     selected = select_top_chunks(
         state["raw_chunks"],
         state["payload"].get("final_chunk_count", 9),
@@ -727,8 +725,8 @@ def node_select_chunks(state: PipelineState) -> Dict[str, Any]:
     return {"selected_chunks": selected}
 
 
-# Node 5 – Angle selection
-def node_select_angle(state: PipelineState) -> Dict[str, Any]:
+# Node: run_angle_selection — picks the best content angle
+def node_run_angle_selection(state: PipelineState) -> Dict[str, Any]:
     svc = _get_services()
     payload = state["payload"]
 
@@ -748,8 +746,8 @@ def node_select_angle(state: PipelineState) -> Dict[str, Any]:
     return {"angle_selection": angle_selection}
 
 
-# Node 6 – Final content generation
-def node_generate_content(state: PipelineState) -> Dict[str, Any]:
+# Node: run_final_content — generates the full content pack
+def node_run_final_content(state: PipelineState) -> Dict[str, Any]:
     svc = _get_services()
     payload = state["payload"]
 
@@ -781,22 +779,23 @@ def node_generate_content(state: PipelineState) -> Dict[str, Any]:
 def build_graph():
     builder = StateGraph(PipelineState)
 
-    builder.add_node("brief", node_brief)
-    builder.add_node("summarize_brief_memory", node_summarize_brief_memory)
-    builder.add_node("generate_queries", node_generate_queries)
-    builder.add_node("retrieve_chunks", node_retrieve_chunks)
-    builder.add_node("select_chunks", node_select_chunks)
-    builder.add_node("select_angle", node_select_angle)
-    builder.add_node("generate_content", node_generate_content)
+    # All node names prefixed with "run_" — safe from PipelineState key conflicts
+    builder.add_node("run_brief", node_run_brief)
+    builder.add_node("run_memory_summary", node_run_memory_summary)
+    builder.add_node("run_queries", node_run_queries)
+    builder.add_node("run_retrieval", node_run_retrieval)
+    builder.add_node("run_chunk_selection", node_run_chunk_selection)
+    builder.add_node("run_angle_selection", node_run_angle_selection)
+    builder.add_node("run_final_content", node_run_final_content)
 
-    builder.add_edge(START, "brief")
-    builder.add_edge("brief", "summarize_brief_memory")
-    builder.add_edge("summarize_brief_memory", "generate_queries")
-    builder.add_edge("generate_queries", "retrieve_chunks")
-    builder.add_edge("retrieve_chunks", "select_chunks")
-    builder.add_edge("select_chunks", "select_angle")
-    builder.add_edge("select_angle", "generate_content")
-    builder.add_edge("generate_content", END)
+    builder.add_edge(START, "run_brief")
+    builder.add_edge("run_brief", "run_memory_summary")
+    builder.add_edge("run_memory_summary", "run_queries")
+    builder.add_edge("run_queries", "run_retrieval")
+    builder.add_edge("run_retrieval", "run_chunk_selection")
+    builder.add_edge("run_chunk_selection", "run_angle_selection")
+    builder.add_edge("run_angle_selection", "run_final_content")
+    builder.add_edge("run_final_content", END)
 
     checkpointer = MemorySaver()
     return builder.compile(checkpointer=checkpointer), checkpointer
@@ -827,7 +826,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Cricket Psychology RAG API",
     version="2.0.0",
-    description="LangGraph 6-node RAG pipeline for cricket psychology content generation.",
+    description="LangGraph 7-node RAG pipeline for cricket psychology content generation.",
     lifespan=lifespan,
 )
 
