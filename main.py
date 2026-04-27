@@ -120,8 +120,8 @@ class Settings(BaseModel):
     brief_model: str = "gpt-4.1-mini"
     query_model: str = "gpt-4.1-mini"
     angle_model: str = "gpt-4.1"
-    final_model: str = "gpt-4.1"
-    summary_model: str = "gpt-4.1-mini"
+    final_model: str = "gpt-4.1-mini"
+    summary_model: str = "gpt-4o-mini"
 
     top_k_per_query: int = 5
     final_chunk_count: int = 9
