@@ -6,7 +6,8 @@ from typing import Annotated, Any, Dict, List, Literal, Optional
 from operator import add
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+from pydantic import ConfigDict
 from openai import OpenAI
 from pinecone import Pinecone
 
@@ -91,25 +92,95 @@ class QueryGenerationResponse(BaseModel):
     queries: List[QueryItem]
 
 
+# ---------------------------------------------------------------------------
+# Angle models — resilient to LLM field-name drift
+# ---------------------------------------------------------------------------
+
+# Maps every known LLM-generated variant -> canonical field name.
+# Add more entries here if the LLM invents new names in the future.
+_ANGLE_OPTION_KEY_MAP: Dict[str, str] = {
+    # why_it_could_work variants
+    "why_it_works": "why_it_could_work",
+    "why_this_could_work": "why_it_could_work",
+    "why_it_might_work": "why_it_could_work",
+    "reason": "why_it_could_work",
+    "rationale": "why_it_could_work",
+    "why": "why_it_could_work",
+    # one_line_idea variants
+    "idea": "one_line_idea",
+    "one_line": "one_line_idea",
+    "summary": "one_line_idea",
+    "description": "one_line_idea",
+}
+
+_CHOSEN_ANGLE_KEY_MAP: Dict[str, str] = {
+    # why_this_is_best variants
+    "why_it_is_best": "why_this_is_best",
+    "why_best": "why_this_is_best",
+    "rationale": "why_this_is_best",
+    "reason": "why_this_is_best",
+    "why": "why_this_is_best",
+    "why_this_works_best": "why_this_is_best",
+    # practical_promise variants
+    "promise": "practical_promise",
+    "practical_outcome": "practical_promise",
+    "outcome": "practical_promise",
+    # emotional_hook variants
+    "hook": "emotional_hook",
+    "emotion": "emotional_hook",
+}
+
+
+def _remap_keys(d: Dict[str, Any], key_map: Dict[str, str]) -> Dict[str, Any]:
+    """Rename keys in dict `d` using `key_map` (only if canonical key is absent)."""
+    result = dict(d)
+    for variant, canonical in key_map.items():
+        if variant in result and canonical not in result:
+            result[canonical] = result.pop(variant)
+    return result
+
+
 class AngleOption(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
     angle_name: str
     one_line_idea: str
     why_it_could_work: str
     risk: str
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalise_keys(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            return _remap_keys(data, _ANGLE_OPTION_KEY_MAP)
+        return data
+
 
 class ChosenAngle(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
     angle_name: str
     core_message: str
     emotional_hook: str
     practical_promise: str
     why_this_is_best: str
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalise_keys(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            return _remap_keys(data, _CHOSEN_ANGLE_KEY_MAP)
+        return data
+
 
 class AngleSelectionResponse(BaseModel):
     angle_options: List[AngleOption]
     chosen_angle: ChosenAngle
 
+
+# ---------------------------------------------------------------------------
+# Final content models
+# ---------------------------------------------------------------------------
 
 class CarouselSlide(BaseModel):
     slide_number: int
@@ -306,6 +377,12 @@ Selected retrieved knowledge:
 {selected_knowledge}
 
 Generate 5 possible content angles, then choose the best one.
+
+IMPORTANT: Each angle_options item MUST use EXACTLY these field names:
+  "angle_name", "one_line_idea", "why_it_could_work", "risk"
+
+The chosen_angle MUST use EXACTLY these field names:
+  "angle_name", "core_message", "emotional_hook", "practical_promise", "why_this_is_best"
 
 Return only valid JSON:
 
@@ -554,14 +631,12 @@ def select_top_chunks(
     selected: List[Dict[str, Any]] = []
     selected_ids: set = set()
 
-    # Guarantee at least 2 from each query type
     for qt in ["symptom", "mental_skill", "deep_psychology"]:
         for chunk in by_type.get(qt, [])[:2]:
             if chunk["id"] not in selected_ids:
                 selected.append(chunk)
                 selected_ids.add(chunk["id"])
 
-    # Fill remaining slots with highest ranked remaining chunks
     remaining = sorted(
         [c for c in ranked if c["id"] not in selected_ids],
         key=lambda x: x["final_rank_score"],
@@ -591,7 +666,7 @@ class AppState:
     checkpointer: Any
 
 
-_app_state_ref: AppState = None  # set during lifespan
+_app_state_ref: AppState = None
 
 
 def _get_services() -> AppState:
@@ -604,7 +679,6 @@ def _get_services() -> AppState:
 #       All nodes are prefixed with "run_" to avoid that conflict.
 # ---------------------------------------------------------------------------
 
-# Node: run_brief — generates the content brief; the ONLY node that uses memory
 def node_run_brief(state: PipelineState) -> Dict[str, Any]:
     svc = _get_services()
     payload = state["payload"]
@@ -630,8 +704,6 @@ def node_run_brief(state: PipelineState) -> Dict[str, Any]:
         ),
     )
     brief = BriefResponse.model_validate(raw).model_dump()
-
-    # Record this turn: HumanMessage = input, AIMessage = brief output
     new_messages = [
         HumanMessage(content=f"Problem: {payload['problem']}"),
         AIMessage(content=json.dumps(brief)),
@@ -639,7 +711,6 @@ def node_run_brief(state: PipelineState) -> Dict[str, Any]:
     return {"brief": brief, "messages": new_messages}
 
 
-# Node: run_memory_summary — trims messages to last 1 pair, updates brief_summary
 def node_run_memory_summary(state: PipelineState) -> Dict[str, Any]:
     svc = _get_services()
     messages = state.get("messages", [])
@@ -668,13 +739,10 @@ def node_run_memory_summary(state: PipelineState) -> Dict[str, Any]:
         timeout=30,
     )
     new_summary = response.choices[0].message.content.strip()
-
-    # Delete all messages except the last 2 (most recent Human+AI pair)
     delete_msgs = [RemoveMessage(id=m.id) for m in messages[:-2]]
     return {"brief_summary": new_summary, "messages": delete_msgs}
 
 
-# Node: run_queries — generates 3 Pinecone search queries from the brief
 def node_run_queries(state: PipelineState) -> Dict[str, Any]:
     svc = _get_services()
     payload = state["payload"]
@@ -695,7 +763,6 @@ def node_run_queries(state: PipelineState) -> Dict[str, Any]:
     return {"queries": queries}
 
 
-# Node: run_retrieval — fetches top_k chunks per query from Pinecone
 def node_run_retrieval(state: PipelineState) -> Dict[str, Any]:
     svc = _get_services()
 
@@ -716,7 +783,6 @@ def node_run_retrieval(state: PipelineState) -> Dict[str, Any]:
     return {"raw_chunks": all_chunks}
 
 
-# Node: run_chunk_selection — diversity-aware 15→9 selection
 def node_run_chunk_selection(state: PipelineState) -> Dict[str, Any]:
     selected = select_top_chunks(
         state["raw_chunks"],
@@ -725,7 +791,6 @@ def node_run_chunk_selection(state: PipelineState) -> Dict[str, Any]:
     return {"selected_chunks": selected}
 
 
-# Node: run_angle_selection — picks the best content angle
 def node_run_angle_selection(state: PipelineState) -> Dict[str, Any]:
     svc = _get_services()
     payload = state["payload"]
@@ -746,7 +811,6 @@ def node_run_angle_selection(state: PipelineState) -> Dict[str, Any]:
     return {"angle_selection": angle_selection}
 
 
-# Node: run_final_content — generates the full content pack
 def node_run_final_content(state: PipelineState) -> Dict[str, Any]:
     svc = _get_services()
     payload = state["payload"]
@@ -779,7 +843,6 @@ def node_run_final_content(state: PipelineState) -> Dict[str, Any]:
 def build_graph():
     builder = StateGraph(PipelineState)
 
-    # All node names prefixed with "run_" — safe from PipelineState key conflicts
     builder.add_node("run_brief", node_run_brief)
     builder.add_node("run_memory_summary", node_run_memory_summary)
     builder.add_node("run_queries", node_run_queries)
