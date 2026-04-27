@@ -1,11 +1,14 @@
 import json
 import os
 import hashlib
+import secrets
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, Dict, List, Literal, Optional
 from operator import add
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi.security import APIKeyHeader
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, model_validator
 from pydantic import ConfigDict
 from openai import OpenAI
@@ -19,7 +22,7 @@ from typing_extensions import TypedDict
 
 
 # ---------------------------------------------------------------------------
-# Settings
+# Settings  (per-node model config)
 # ---------------------------------------------------------------------------
 
 class Settings(BaseModel):
@@ -28,7 +31,14 @@ class Settings(BaseModel):
     pinecone_index_host: str
     pinecone_namespace: str = "content-automate"
     embedding_model: str = "text-embedding-3-small"
-    llm_model: str = "gpt-4o-mini"
+
+    # Per-node model overrides
+    brief_model: str = "gpt-4.1-mini"
+    query_model: str = "gpt-4.1-mini"
+    angle_model: str = "gpt-4.1"
+    final_model: str = "gpt-4.1"
+    summary_model: str = "gpt-4.1-mini"
+
     top_k_per_query: int = 5
     final_chunk_count: int = 9
 
@@ -48,10 +58,30 @@ class Settings(BaseModel):
             pinecone_index_host=required["pinecone_index_host"],
             pinecone_namespace=os.getenv("PINECONE_NAMESPACE", "content-automate"),
             embedding_model=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
-            llm_model=os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini"),
+            brief_model=os.getenv("BRIEF_MODEL", "gpt-4.1-mini"),
+            query_model=os.getenv("QUERY_MODEL", "gpt-4.1-mini"),
+            angle_model=os.getenv("ANGLE_MODEL", "gpt-4.1"),
+            final_model=os.getenv("FINAL_MODEL", "gpt-4.1"),
+            summary_model=os.getenv("SUMMARY_MODEL", "gpt-4.1-mini"),
             top_k_per_query=int(os.getenv("TOP_K_PER_QUERY", "5")),
             final_chunk_count=int(os.getenv("FINAL_CHUNK_COUNT", "9")),
         )
+
+
+# ---------------------------------------------------------------------------
+# API-Key auth
+# ---------------------------------------------------------------------------
+
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def require_api_key(api_key: str = Security(_api_key_header)) -> bool:
+    expected = os.getenv("APP_API_KEY", "")
+    if not expected:
+        raise HTTPException(status_code=500, detail="Server auth not configured")
+    if not api_key or not secrets.compare_digest(api_key.strip(), expected.strip()):
+        raise HTTPException(status_code=401, detail="Unauthorized: invalid or missing X-API-Key header")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -96,43 +126,35 @@ class QueryGenerationResponse(BaseModel):
 # Angle models — resilient to LLM field-name drift
 # ---------------------------------------------------------------------------
 
-# Maps every known LLM-generated variant -> canonical field name.
-# Add more entries here if the LLM invents new names in the future.
 _ANGLE_OPTION_KEY_MAP: Dict[str, str] = {
-    # why_it_could_work variants
-    "why_it_works": "why_it_could_work",
+    "why_it_works":        "why_it_could_work",
     "why_this_could_work": "why_it_could_work",
-    "why_it_might_work": "why_it_could_work",
-    "reason": "why_it_could_work",
-    "rationale": "why_it_could_work",
-    "why": "why_it_could_work",
-    # one_line_idea variants
-    "idea": "one_line_idea",
-    "one_line": "one_line_idea",
-    "summary": "one_line_idea",
-    "description": "one_line_idea",
+    "why_it_might_work":   "why_it_could_work",
+    "reason":              "why_it_could_work",
+    "rationale":           "why_it_could_work",
+    "why":                 "why_it_could_work",
+    "idea":                "one_line_idea",
+    "one_line":            "one_line_idea",
+    "summary":             "one_line_idea",
+    "description":         "one_line_idea",
 }
 
 _CHOSEN_ANGLE_KEY_MAP: Dict[str, str] = {
-    # why_this_is_best variants
-    "why_it_is_best": "why_this_is_best",
-    "why_best": "why_this_is_best",
-    "rationale": "why_this_is_best",
-    "reason": "why_this_is_best",
-    "why": "why_this_is_best",
-    "why_this_works_best": "why_this_is_best",
-    # practical_promise variants
-    "promise": "practical_promise",
-    "practical_outcome": "practical_promise",
-    "outcome": "practical_promise",
-    # emotional_hook variants
-    "hook": "emotional_hook",
-    "emotion": "emotional_hook",
+    "why_it_is_best":       "why_this_is_best",
+    "why_best":             "why_this_is_best",
+    "rationale":            "why_this_is_best",
+    "reason":               "why_this_is_best",
+    "why":                  "why_this_is_best",
+    "why_this_works_best":  "why_this_is_best",
+    "promise":              "practical_promise",
+    "practical_outcome":    "practical_promise",
+    "outcome":              "practical_promise",
+    "hook":                 "emotional_hook",
+    "emotion":              "emotional_hook",
 }
 
 
 def _remap_keys(d: Dict[str, Any], key_map: Dict[str, str]) -> Dict[str, Any]:
-    """Rename keys in dict `d` using `key_map` (only if canonical key is absent)."""
     result = dict(d)
     for variant, canonical in key_map.items():
         if variant in result and canonical not in result:
@@ -220,19 +242,12 @@ class FinalContentResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class PipelineState(TypedDict):
-    # ── Inputs ──────────────────────────────────────────────────────────────
     payload: Dict[str, Any]
-
-    # ── Memory: scoped to run_brief node only ────────────────────────────────
-    # add_messages reducer merges new messages into the list.
-    # run_memory_summary trims to last 1 pair and maintains brief_summary.
     messages: Annotated[List[Any], add_messages]
     brief_summary: str
-
-    # ── Pipeline stage outputs ───────────────────────────────────────────────
     brief: Optional[Dict[str, Any]]
     queries: Optional[List[Dict[str, Any]]]
-    raw_chunks: Annotated[List[Dict[str, Any]], add]   # accumulates via reducer
+    raw_chunks: Annotated[List[Dict[str, Any]], add]
     selected_chunks: Optional[List[Dict[str, Any]]]
     angle_selection: Optional[Dict[str, Any]]
     final_content: Optional[Dict[str, Any]]
@@ -501,6 +516,17 @@ Writing rules:
 - The carousel slides should be punchy and easy to read.
 - Return JSON only."""
 
+JSON_REPAIR_PROMPT = """The following JSON was returned by an AI but failed schema validation.
+
+Validation error:
+{error}
+
+Invalid JSON:
+{raw_json}
+
+Fix ONLY the schema issues described in the error. Do not change any actual content values.
+Return only valid JSON. No markdown fences. No explanation."""
+
 
 # ---------------------------------------------------------------------------
 # Helper utilities
@@ -510,19 +536,52 @@ def _parse_llm_json(raw: str) -> Dict[str, Any]:
     """Strip markdown fences and parse JSON robustly."""
     raw = raw.strip()
     if raw.startswith("```"):
-        raw = raw.split("\n", 1)[-1]
-        raw = raw.rsplit("```", 1)[0].strip()
+        lines = raw.split("\n")
+        # drop first fence line and last fence line
+        inner = lines[1:] if lines[0].startswith("```") else lines
+        if inner and inner[-1].strip() == "```":
+            inner = inner[:-1]
+        raw = "\n".join(inner).strip()
     return json.loads(raw)
 
 
-def _llm_call(client: OpenAI, model: str, prompt: str) -> Dict[str, Any]:
+def _llm_call(
+    client: OpenAI,
+    model: str,
+    prompt: str,
+    self_heal_model: str = "gpt-4.1-mini",
+) -> Dict[str, Any]:
+    """Call the LLM. On JSON parse failure, attempt one self-heal pass."""
     response = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
-        timeout=60,
     )
-    return _parse_llm_json(response.choices[0].message.content)
+    raw = response.choices[0].message.content
+    try:
+        return _parse_llm_json(raw)
+    except json.JSONDecodeError as first_err:
+        # Self-heal: send raw output + error back to model and ask it to fix
+        heal_response = client.chat.completions.create(
+            model=self_heal_model,
+            messages=[{
+                "role": "user",
+                "content": JSON_REPAIR_PROMPT.format(
+                    error=str(first_err),
+                    raw_json=raw,
+                )
+            }],
+            temperature=0.0,
+        )
+        healed_raw = heal_response.choices[0].message.content
+        try:
+            return _parse_llm_json(healed_raw)
+        except json.JSONDecodeError as second_err:
+            raise json.JSONDecodeError(
+                f"LLM JSON failed after self-heal attempt. Original: {first_err}. Healed attempt: {second_err}",
+                second_err.doc,
+                second_err.pos,
+            )
 
 
 def _embed_text(client: OpenAI, model: str, text: str) -> List[float]:
@@ -578,12 +637,6 @@ def _dedupe_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _normalize_and_rank(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Compute final_rank_score per chunk.
-    Formula: 0.75 * normalized_vector_score
-           + 0.15 * diversity_bonus   (varies by query_type)
-           + 0.10 * source_priority   (capped at 0.10)
-    """
     diversity_bonus_map = {
         "symptom": 0.04,
         "mental_skill": 0.06,
@@ -612,10 +665,6 @@ def _normalize_and_rank(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def select_top_chunks(
     chunks: List[Dict[str, Any]], final_chunk_count: int = 9
 ) -> List[Dict[str, Any]]:
-    """
-    Dedup → rank → guarantee diversity (2 per query_type first)
-    → fill remainder by score → cap at final_chunk_count.
-    """
     deduped = _dedupe_chunks(chunks)
     ranked = _normalize_and_rank(deduped)
 
@@ -654,6 +703,180 @@ def select_top_chunks(
 
 
 # ---------------------------------------------------------------------------
+# HTML output renderer
+# ---------------------------------------------------------------------------
+
+def _render_html(data: Dict[str, Any], payload: Dict[str, Any]) -> str:
+    fc = data.get("final_content", {})
+
+    def esc(s: Any) -> str:
+        return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    hook_items = "".join(f"<li>{esc(h)}</li>" for h in fc.get("hook_options", []))
+
+    reel = fc.get("reel_script", {})
+    reel_rows = "".join(
+        f"<tr><td class='label'>{esc(k.replace('_',' ').title())}</td><td>{esc(v)}</td></tr>"
+        for k, v in reel.items()
+    )
+
+    slides = fc.get("carousel_slides", [])
+    slide_cards = "".join(
+        f"<div class='slide-card'><span class='slide-num'>Slide {esc(s.get('slide_number',''))}</span><p>{esc(s.get('slide_text',''))}</p></div>"
+        for s in slides
+    )
+
+    drill = fc.get("mental_drill", {})
+    drill_steps = "".join(f"<li>{esc(step)}</li>" for step in drill.get("steps", []))
+
+    hashtags = " ".join(f"<span class='tag'>{esc(h)}</span>" for h in fc.get("hashtags", []))
+
+    sg = fc.get("source_grounding", {})
+    chunk_ids = ", ".join(esc(c) for c in sg.get("retrieved_chunk_ids_used", []))
+    key_ideas = "".join(f"<li>{esc(k)}</li>" for k in sg.get("key_ideas_used", []))
+
+    debug_section = ""
+    if data.get("content_brief"):
+        brief_rows = "".join(
+            f"<tr><td class='label'>{esc(k)}</td><td>{esc(v)}</td></tr>"
+            for k, v in data["content_brief"].items()
+        )
+        angle = data.get("angle_selection", {})
+        chosen = angle.get("chosen_angle", {})
+        chosen_rows = "".join(
+            f"<tr><td class='label'>{esc(k)}</td><td>{esc(v)}</td></tr>"
+            for k, v in chosen.items()
+        )
+        queries = data.get("retrieval_queries", [])
+        query_rows = "".join(
+            f"<tr><td class='label'>{esc(q.get('query_type',''))}</td><td>{esc(q.get('query',''))}</td></tr>"
+            for q in queries
+        )
+        debug_section = f"""
+        <section class='debug-section'>
+          <h2>🛠 Debug Info</h2>
+          <h3>Content Brief</h3>
+          <table>{brief_rows}</table>
+          <h3>Retrieval Queries</h3>
+          <table>{query_rows}</table>
+          <h3>Chosen Angle</h3>
+          <table>{chosen_rows}</table>
+          <p class='muted'>Retrieved candidate chunks: {esc(data.get('retrieved_candidate_count', 0))}</p>
+        </section>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{esc(fc.get('content_title', 'Content Pack'))}</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      padding: 2rem 1rem;
+      line-height: 1.6;
+    }}
+    .container {{ max-width: 900px; margin: 0 auto; }}
+    h1 {{ font-size: 1.8rem; color: #f8fafc; margin-bottom: .25rem; }}
+    h2 {{ font-size: 1.2rem; color: #94a3b8; text-transform: uppercase; letter-spacing: .08em; margin: 2rem 0 .75rem; border-bottom: 1px solid #1e293b; padding-bottom: .5rem; }}
+    h3 {{ font-size: 1rem; color: #64748b; margin: 1.25rem 0 .5rem; }}
+    section {{ background: #1e293b; border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; }}
+    .meta {{ color: #64748b; font-size: .85rem; margin-bottom: 1rem; }}
+    .chip {{ display: inline-block; background: #0f172a; border: 1px solid #334155; border-radius: 999px; padding: .2rem .75rem; font-size: .8rem; color: #94a3b8; margin: .15rem; }}
+    p {{ margin-bottom: .75rem; color: #cbd5e1; }}
+    ul {{ padding-left: 1.25rem; color: #cbd5e1; }}
+    ul li {{ margin-bottom: .4rem; }}
+    table {{ width: 100%; border-collapse: collapse; margin-top: .5rem; }}
+    td {{ padding: .5rem .75rem; vertical-align: top; border-bottom: 1px solid #0f172a; font-size: .9rem; }}
+    td.label {{ width: 170px; color: #64748b; font-weight: 600; white-space: nowrap; }}
+    .primary-hook {{ background: #0f2a47; border-left: 4px solid #3b82f6; padding: 1rem 1.25rem; border-radius: 8px; font-size: 1.05rem; color: #bfdbfe; margin-bottom: 1rem; }}
+    .short-reel {{ background: #0f172a; border-radius: 8px; padding: 1rem; white-space: pre-wrap; font-size: .92rem; color: #e2e8f0; }}
+    .caption-box {{ background: #0f172a; border-radius: 8px; padding: 1rem; white-space: pre-wrap; font-size: .92rem; color: #e2e8f0; }}
+    .slides-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1rem; margin-top: .5rem; }}
+    .slide-card {{ background: #0f172a; border-radius: 10px; padding: 1rem; }}
+    .slide-num {{ font-size: .75rem; color: #64748b; display: block; margin-bottom: .35rem; text-transform: uppercase; letter-spacing: .05em; }}
+    .slide-card p {{ color: #cbd5e1; font-size: .88rem; margin: 0; }}
+    .tag {{ display: inline-block; background: #0c2a1a; border: 1px solid #166534; color: #4ade80; border-radius: 999px; padding: .2rem .75rem; font-size: .8rem; margin: .15rem; }}
+    .takeaway {{ font-size: 1.1rem; font-weight: 600; color: #f8fafc; padding: 1rem; background: #16213e; border-left: 4px solid #6366f1; border-radius: 8px; }}
+    .cta-box {{ background: #1a0533; border-left: 4px solid #a855f7; padding: 1rem; border-radius: 8px; color: #e9d5ff; }}
+    .muted {{ color: #475569; font-size: .8rem; margin-top: .5rem; }}
+    .debug-section {{ background: #1a1a2e; border: 1px dashed #334155; border-radius: 12px; padding: 1.5rem; margin-top: 2rem; }}
+    .debug-section h2 {{ color: #f59e0b; }}
+    .badge {{ display: inline-block; background: #1e3a2f; color: #34d399; padding: .15rem .6rem; border-radius: 6px; font-size: .75rem; font-weight: 700; margin-left: .5rem; }}
+    @media (max-width: 600px) {{ td.label {{ width: 120px; }} }}
+  </style>
+</head>
+<body>
+<div class="container">
+  <section>
+    <h1>{esc(fc.get('content_title', ''))} <span class='badge'>RAG Output</span></h1>
+    <div class="meta">
+      {esc(payload.get('cricket_role',''))} &nbsp;·&nbsp;
+      {esc(payload.get('player_level',''))} &nbsp;·&nbsp;
+      {esc(payload.get('category',''))} → {esc(payload.get('sub_category',''))} &nbsp;·&nbsp;
+      Angle: {esc(payload.get('psychology_angle',''))}
+    </div>
+    <p><strong>Topic:</strong> {esc(fc.get('topic', ''))}</p>
+    <p><strong>Core Insight:</strong> {esc(fc.get('core_insight', ''))}</p>
+  </section>
+
+  <section>
+    <h2>🎣 Hooks</h2>
+    <div class="primary-hook">⭐ {esc(fc.get('primary_hook', ''))}</div>
+    <ul>{hook_items}</ul>
+  </section>
+
+  <section>
+    <h2>🎬 Reel Script</h2>
+    <table>{reel_rows}</table>
+    <h3>Short Reel Script</h3>
+    <div class="short-reel">{esc(fc.get('short_reel_script', ''))}</div>
+  </section>
+
+  <section>
+    <h2>📝 Caption</h2>
+    <div class="caption-box">{esc(fc.get('caption', ''))}</div>
+  </section>
+
+  <section>
+    <h2>🎠 Carousel Slides</h2>
+    <div class="slides-grid">{slide_cards}</div>
+  </section>
+
+  <section>
+    <h2>🧠 Mental Drill</h2>
+    <p><strong>{esc(drill.get('name', ''))}</strong> — {esc(drill.get('when_to_use', ''))}</p>
+    <ul>{drill_steps}</ul>
+  </section>
+
+  <section>
+    <h2>💡 Takeaway & CTA</h2>
+    <div class="takeaway">{esc(fc.get('one_line_takeaway', ''))}</div>
+    <div class="cta-box" style="margin-top:1rem">{esc(fc.get('cta', ''))}</div>
+  </section>
+
+  <section>
+    <h2>#️⃣ Hashtags</h2>
+    <div>{hashtags}</div>
+  </section>
+
+  <section>
+    <h2>📚 Source Grounding</h2>
+    <p class="muted">Chunk IDs used: {chunk_ids}</p>
+    <ul>{key_ideas}</ul>
+  </section>
+
+  {debug_section}
+</div>
+</body>
+</html>"""
+    return html
+
+
+# ---------------------------------------------------------------------------
 # App-level shared state
 # ---------------------------------------------------------------------------
 
@@ -675,8 +898,6 @@ def _get_services() -> AppState:
 
 # ---------------------------------------------------------------------------
 # LangGraph nodes
-# NOTE: Node names must NOT match any key in PipelineState.
-#       All nodes are prefixed with "run_" to avoid that conflict.
 # ---------------------------------------------------------------------------
 
 def node_run_brief(state: PipelineState) -> Dict[str, Any]:
@@ -692,7 +913,7 @@ def node_run_brief(state: PipelineState) -> Dict[str, Any]:
 
     raw = _llm_call(
         svc.openai_client,
-        svc.settings.llm_model,
+        svc.settings.brief_model,
         BRIEF_PROMPT.format(
             summary_context=summary_context,
             problem=payload["problem"],
@@ -732,11 +953,10 @@ def node_run_memory_summary(state: PipelineState) -> Dict[str, Any]:
         )
 
     response = svc.openai_client.chat.completions.create(
-        model=svc.settings.llm_model,
+        model=svc.settings.summary_model,
         messages=[{"role": "user", "content": summary_prompt}],
         temperature=0.2,
         max_tokens=200,
-        timeout=30,
     )
     new_summary = response.choices[0].message.content.strip()
     delete_msgs = [RemoveMessage(id=m.id) for m in messages[:-2]]
@@ -749,7 +969,7 @@ def node_run_queries(state: PipelineState) -> Dict[str, Any]:
 
     raw = _llm_call(
         svc.openai_client,
-        svc.settings.llm_model,
+        svc.settings.query_model,
         QUERY_PROMPT.format(
             problem=payload["problem"],
             cricket_role=payload["cricket_role"],
@@ -797,7 +1017,7 @@ def node_run_angle_selection(state: PipelineState) -> Dict[str, Any]:
 
     raw = _llm_call(
         svc.openai_client,
-        svc.settings.llm_model,
+        svc.settings.angle_model,
         ANGLE_PROMPT.format(
             problem=payload["problem"],
             cricket_role=payload["cricket_role"],
@@ -817,7 +1037,7 @@ def node_run_final_content(state: PipelineState) -> Dict[str, Any]:
 
     raw = _llm_call(
         svc.openai_client,
-        svc.settings.llm_model,
+        svc.settings.final_model,
         FINAL_PROMPT.format(
             problem=payload["problem"],
             category=payload["category"],
@@ -888,7 +1108,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Cricket Psychology RAG API",
-    version="2.0.0",
+    version="3.0.0",
     description="LangGraph 7-node RAG pipeline for cricket psychology content generation.",
     lifespan=lifespan,
 )
@@ -899,7 +1119,11 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/generate-content")
+@app.post(
+    "/generate-content",
+    response_class=HTMLResponse,
+    dependencies=[Depends(require_api_key)],
+)
 def generate_content(payload: GenerateContentRequest):
     try:
         svc: AppState = app.state.services
@@ -919,13 +1143,13 @@ def generate_content(payload: GenerateContentRequest):
 
         result = svc.graph.invoke(initial_state, config=config)
 
-        response: Dict[str, Any] = {
+        response_data: Dict[str, Any] = {
             "status": "success",
             "input": payload.model_dump(),
             "final_content": result["final_content"],
         }
         if payload.debug:
-            response.update({
+            response_data.update({
                 "content_brief": result["brief"],
                 "retrieval_queries": result["queries"],
                 "retrieved_candidate_count": len(result["raw_chunks"]),
@@ -933,11 +1157,12 @@ def generate_content(payload: GenerateContentRequest):
                 "angle_selection": result["angle_selection"],
                 "brief_summary_used": result.get("brief_summary", ""),
             })
-        return response
+
+        return HTMLResponse(content=_render_html(response_data, payload.model_dump()))
 
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except json.JSONDecodeError as e:
-        raise HTTPException(status_code=502, detail=f"LLM returned invalid JSON: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"LLM returned invalid JSON after self-heal: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Pipeline error: {str(e)}")
