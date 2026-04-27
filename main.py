@@ -2,7 +2,9 @@ import json
 import os
 import hashlib
 import secrets
+import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from typing import Annotated, Any, Dict, List, Literal, Optional
 from operator import add
 
@@ -19,6 +21,88 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
 from typing_extensions import TypedDict
+
+
+# ---------------------------------------------------------------------------
+# OpenAI pricing table  (USD per 1M tokens, as of April 2026)
+# Update these if prices change.
+# ---------------------------------------------------------------------------
+
+_MODEL_PRICING: Dict[str, Dict[str, float]] = {
+    "gpt-4.1":          {"input": 2.00,  "output": 8.00},
+    "gpt-4.1-mini":     {"input": 0.40,  "output": 1.60},
+    "gpt-4.1-nano":     {"input": 0.10,  "output": 0.40},
+    "gpt-4o":           {"input": 2.50,  "output": 10.00},
+    "gpt-4o-mini":      {"input": 0.15,  "output": 0.60},
+    # embedding models (only input tokens apply)
+    "text-embedding-3-small": {"input": 0.02, "output": 0.0},
+    "text-embedding-3-large": {"input": 0.13, "output": 0.0},
+}
+
+
+# ---------------------------------------------------------------------------
+# Token tracker  (one instance per request, passed via PipelineState)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class NodeUsage:
+    node: str
+    model: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    cost_usd: float = 0.0
+
+
+@dataclass
+class TokenTracker:
+    entries: List[NodeUsage] = field(default_factory=list)
+    elapsed_seconds: float = 0.0
+
+    def record(self, node: str, model: str, usage: Any) -> None:
+        """Record usage from an OpenAI completion response.usage object."""
+        prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+        completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+        total_tokens = getattr(usage, "total_tokens", 0) or (prompt_tokens + completion_tokens)
+        pricing = _MODEL_PRICING.get(model, {"input": 0.0, "output": 0.0})
+        cost = (
+            prompt_tokens * pricing["input"] / 1_000_000
+            + completion_tokens * pricing["output"] / 1_000_000
+        )
+        self.entries.append(NodeUsage(
+            node=node,
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            cost_usd=cost,
+        ))
+
+    def record_embedding(self, node: str, model: str, token_count: int) -> None:
+        """Record usage from an OpenAI embedding response."""
+        pricing = _MODEL_PRICING.get(model, {"input": 0.0, "output": 0.0})
+        cost = token_count * pricing["input"] / 1_000_000
+        self.entries.append(NodeUsage(
+            node=node,
+            model=model,
+            prompt_tokens=token_count,
+            completion_tokens=0,
+            total_tokens=token_count,
+            cost_usd=cost,
+        ))
+
+    def totals(self) -> Dict[str, Any]:
+        total_prompt = sum(e.prompt_tokens for e in self.entries)
+        total_completion = sum(e.completion_tokens for e in self.entries)
+        total_tokens = sum(e.total_tokens for e in self.entries)
+        total_cost = sum(e.cost_usd for e in self.entries)
+        return {
+            "total_prompt_tokens": total_prompt,
+            "total_completion_tokens": total_completion,
+            "total_tokens": total_tokens,
+            "total_cost_usd": round(total_cost, 6),
+            "elapsed_seconds": round(self.elapsed_seconds, 2),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +248,6 @@ def _remap_keys(d: Dict[str, Any], key_map: Dict[str, str]) -> Dict[str, Any]:
 
 class AngleOption(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
-
     angle_name: str
     one_line_idea: str
     why_it_could_work: str
@@ -180,7 +263,6 @@ class AngleOption(BaseModel):
 
 class ChosenAngle(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
-
     angle_name: str
     core_message: str
     emotional_hook: str
@@ -251,6 +333,7 @@ class PipelineState(TypedDict):
     selected_chunks: Optional[List[Dict[str, Any]]]
     angle_selection: Optional[Dict[str, Any]]
     final_content: Optional[Dict[str, Any]]
+    tracker: Optional[Any]   # TokenTracker instance — not serialised by LangGraph, passed by ref
 
 
 # ---------------------------------------------------------------------------
@@ -537,7 +620,6 @@ def _parse_llm_json(raw: str) -> Dict[str, Any]:
     raw = raw.strip()
     if raw.startswith("```"):
         lines = raw.split("\n")
-        # drop first fence line and last fence line
         inner = lines[1:] if lines[0].startswith("```") else lines
         if inner and inner[-1].strip() == "```":
             inner = inner[:-1]
@@ -549,43 +631,54 @@ def _llm_call(
     client: OpenAI,
     model: str,
     prompt: str,
+    tracker: Optional[TokenTracker] = None,
+    node_name: str = "unknown",
     self_heal_model: str = "gpt-4.1-mini",
 ) -> Dict[str, Any]:
-    """Call the LLM. On JSON parse failure, attempt one self-heal pass."""
+    """Call the LLM, track tokens, and self-heal on JSON parse failure."""
     response = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
     )
+    if tracker and response.usage:
+        tracker.record(node_name, model, response.usage)
+
     raw = response.choices[0].message.content
     try:
         return _parse_llm_json(raw)
     except json.JSONDecodeError as first_err:
-        # Self-heal: send raw output + error back to model and ask it to fix
         heal_response = client.chat.completions.create(
             model=self_heal_model,
-            messages=[{
-                "role": "user",
-                "content": JSON_REPAIR_PROMPT.format(
-                    error=str(first_err),
-                    raw_json=raw,
-                )
-            }],
+            messages=[{"role": "user", "content": JSON_REPAIR_PROMPT.format(
+                error=str(first_err),
+                raw_json=raw,
+            )}],
             temperature=0.0,
         )
+        if tracker and heal_response.usage:
+            tracker.record(f"{node_name}:self_heal", self_heal_model, heal_response.usage)
         healed_raw = heal_response.choices[0].message.content
         try:
             return _parse_llm_json(healed_raw)
         except json.JSONDecodeError as second_err:
             raise json.JSONDecodeError(
-                f"LLM JSON failed after self-heal attempt. Original: {first_err}. Healed attempt: {second_err}",
+                f"LLM JSON failed after self-heal. Original: {first_err}. Healed: {second_err}",
                 second_err.doc,
                 second_err.pos,
             )
 
 
-def _embed_text(client: OpenAI, model: str, text: str) -> List[float]:
+def _embed_text(
+    client: OpenAI,
+    model: str,
+    text: str,
+    tracker: Optional[TokenTracker] = None,
+    node_name: str = "retrieval",
+) -> List[float]:
     result = client.embeddings.create(model=model, input=text)
+    if tracker and result.usage:
+        tracker.record_embedding(node_name, model, result.usage.total_tokens)
     return result.data[0].embedding
 
 
@@ -706,7 +799,11 @@ def select_top_chunks(
 # HTML output renderer
 # ---------------------------------------------------------------------------
 
-def _render_html(data: Dict[str, Any], payload: Dict[str, Any]) -> str:
+def _render_html(
+    data: Dict[str, Any],
+    payload: Dict[str, Any],
+    tracker: Optional[TokenTracker] = None,
+) -> str:
     fc = data.get("final_content", {})
 
     def esc(s: Any) -> str:
@@ -735,6 +832,61 @@ def _render_html(data: Dict[str, Any], payload: Dict[str, Any]) -> str:
     chunk_ids = ", ".join(esc(c) for c in sg.get("retrieved_chunk_ids_used", []))
     key_ideas = "".join(f"<li>{esc(k)}</li>" for k in sg.get("key_ideas_used", []))
 
+    # ── Token / cost section ────────────────────────────────────────────────
+    usage_section = ""
+    if tracker:
+        totals = tracker.totals()
+        node_rows = "".join(
+            f"""
+            <tr>
+              <td class='label'>{esc(e.node)}</td>
+              <td>{esc(e.model)}</td>
+              <td class='num'>{e.prompt_tokens:,}</td>
+              <td class='num'>{e.completion_tokens:,}</td>
+              <td class='num'>{e.total_tokens:,}</td>
+              <td class='num cost'>${e.cost_usd:.6f}</td>
+            </tr>"""
+            for e in tracker.entries
+        )
+        usage_section = f"""
+        <section class='usage-section'>
+          <h2>💰 Token Usage &amp; Cost</h2>
+          <div class='usage-totals'>
+            <div class='stat-box'>
+              <span class='stat-label'>Total Tokens</span>
+              <span class='stat-value'>{totals['total_tokens']:,}</span>
+            </div>
+            <div class='stat-box'>
+              <span class='stat-label'>Prompt Tokens</span>
+              <span class='stat-value'>{totals['total_prompt_tokens']:,}</span>
+            </div>
+            <div class='stat-box'>
+              <span class='stat-label'>Completion Tokens</span>
+              <span class='stat-value'>{totals['total_completion_tokens']:,}</span>
+            </div>
+            <div class='stat-box highlight'>
+              <span class='stat-label'>Total Cost</span>
+              <span class='stat-value'>${totals['total_cost_usd']:.6f}</span>
+            </div>
+            <div class='stat-box'>
+              <span class='stat-label'>Elapsed Time</span>
+              <span class='stat-value'>{totals['elapsed_seconds']}s</span>
+            </div>
+          </div>
+          <h3>Per-Node Breakdown</h3>
+          <table class='usage-table'>
+            <thead>
+              <tr>
+                <th>Node</th><th>Model</th>
+                <th>Prompt</th><th>Completion</th><th>Total</th><th>Cost (USD)</th>
+              </tr>
+            </thead>
+            <tbody>{node_rows}</tbody>
+          </table>
+          <p class='muted'>Prices: gpt-4.1 $2.00/$8.00 · gpt-4.1-mini $0.40/$1.60 · text-embedding-3-small $0.02 per 1M tokens</p>
+        </section>"""
+
+    # ── Debug section ───────────────────────────────────────────────────────
     debug_section = ""
     if data.get("content_brief"):
         brief_rows = "".join(
@@ -785,13 +937,15 @@ def _render_html(data: Dict[str, Any], payload: Dict[str, Any]) -> str:
     h3 {{ font-size: 1rem; color: #64748b; margin: 1.25rem 0 .5rem; }}
     section {{ background: #1e293b; border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; }}
     .meta {{ color: #64748b; font-size: .85rem; margin-bottom: 1rem; }}
-    .chip {{ display: inline-block; background: #0f172a; border: 1px solid #334155; border-radius: 999px; padding: .2rem .75rem; font-size: .8rem; color: #94a3b8; margin: .15rem; }}
     p {{ margin-bottom: .75rem; color: #cbd5e1; }}
     ul {{ padding-left: 1.25rem; color: #cbd5e1; }}
     ul li {{ margin-bottom: .4rem; }}
     table {{ width: 100%; border-collapse: collapse; margin-top: .5rem; }}
-    td {{ padding: .5rem .75rem; vertical-align: top; border-bottom: 1px solid #0f172a; font-size: .9rem; }}
+    td, th {{ padding: .5rem .75rem; vertical-align: top; border-bottom: 1px solid #0f172a; font-size: .9rem; text-align: left; }}
+    th {{ color: #64748b; font-weight: 600; font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; }}
     td.label {{ width: 170px; color: #64748b; font-weight: 600; white-space: nowrap; }}
+    td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+    td.cost {{ color: #34d399; font-weight: 600; }}
     .primary-hook {{ background: #0f2a47; border-left: 4px solid #3b82f6; padding: 1rem 1.25rem; border-radius: 8px; font-size: 1.05rem; color: #bfdbfe; margin-bottom: 1rem; }}
     .short-reel {{ background: #0f172a; border-radius: 8px; padding: 1rem; white-space: pre-wrap; font-size: .92rem; color: #e2e8f0; }}
     .caption-box {{ background: #0f172a; border-radius: 8px; padding: 1rem; white-space: pre-wrap; font-size: .92rem; color: #e2e8f0; }}
@@ -802,11 +956,20 @@ def _render_html(data: Dict[str, Any], payload: Dict[str, Any]) -> str:
     .tag {{ display: inline-block; background: #0c2a1a; border: 1px solid #166534; color: #4ade80; border-radius: 999px; padding: .2rem .75rem; font-size: .8rem; margin: .15rem; }}
     .takeaway {{ font-size: 1.1rem; font-weight: 600; color: #f8fafc; padding: 1rem; background: #16213e; border-left: 4px solid #6366f1; border-radius: 8px; }}
     .cta-box {{ background: #1a0533; border-left: 4px solid #a855f7; padding: 1rem; border-radius: 8px; color: #e9d5ff; }}
-    .muted {{ color: #475569; font-size: .8rem; margin-top: .5rem; }}
+    .muted {{ color: #475569; font-size: .8rem; margin-top: .75rem; }}
+    .usage-section {{ background: #0f2a1a; border: 1px solid #166534; border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; }}
+    .usage-section h2 {{ color: #4ade80; border-bottom-color: #166534; }}
+    .usage-totals {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: .75rem; margin-bottom: 1.25rem; }}
+    .stat-box {{ background: #0f172a; border-radius: 8px; padding: .75rem 1rem; }}
+    .stat-box.highlight {{ background: #064e3b; border: 1px solid #34d399; }}
+    .stat-label {{ display: block; font-size: .72rem; color: #64748b; text-transform: uppercase; letter-spacing: .06em; margin-bottom: .2rem; }}
+    .stat-value {{ display: block; font-size: 1.15rem; font-weight: 700; color: #f8fafc; font-variant-numeric: tabular-nums; }}
+    .stat-box.highlight .stat-value {{ color: #34d399; }}
+    .usage-table th {{ background: #0f172a; }}
     .debug-section {{ background: #1a1a2e; border: 1px dashed #334155; border-radius: 12px; padding: 1.5rem; margin-top: 2rem; }}
-    .debug-section h2 {{ color: #f59e0b; }}
+    .debug-section h2 {{ color: #f59e0b; border-bottom-color: #334155; }}
     .badge {{ display: inline-block; background: #1e3a2f; color: #34d399; padding: .15rem .6rem; border-radius: 6px; font-size: .75rem; font-weight: 700; margin-left: .5rem; }}
-    @media (max-width: 600px) {{ td.label {{ width: 120px; }} }}
+    @media (max-width: 600px) {{ td.label {{ width: 100px; }} .usage-totals {{ grid-template-columns: 1fr 1fr; }} }}
   </style>
 </head>
 <body>
@@ -822,6 +985,8 @@ def _render_html(data: Dict[str, Any], payload: Dict[str, Any]) -> str:
     <p><strong>Topic:</strong> {esc(fc.get('topic', ''))}</p>
     <p><strong>Core Insight:</strong> {esc(fc.get('core_insight', ''))}</p>
   </section>
+
+  {usage_section}
 
   <section>
     <h2>🎣 Hooks</h2>
@@ -853,7 +1018,7 @@ def _render_html(data: Dict[str, Any], payload: Dict[str, Any]) -> str:
   </section>
 
   <section>
-    <h2>💡 Takeaway & CTA</h2>
+    <h2>💡 Takeaway &amp; CTA</h2>
     <div class="takeaway">{esc(fc.get('one_line_takeaway', ''))}</div>
     <div class="cta-box" style="margin-top:1rem">{esc(fc.get('cta', ''))}</div>
   </section>
@@ -903,12 +1068,12 @@ def _get_services() -> AppState:
 def node_run_brief(state: PipelineState) -> Dict[str, Any]:
     svc = _get_services()
     payload = state["payload"]
+    tracker: TokenTracker = state.get("tracker")
 
     summary = state.get("brief_summary", "")
     summary_context = (
         f"Context from your previous brief for a related request:\n{summary}\n"
-        if summary
-        else ""
+        if summary else ""
     )
 
     raw = _llm_call(
@@ -923,6 +1088,8 @@ def node_run_brief(state: PipelineState) -> Dict[str, Any]:
             player_level=payload["player_level"],
             psychology_angle=payload["psychology_angle"],
         ),
+        tracker=tracker,
+        node_name="run_brief",
     )
     brief = BriefResponse.model_validate(raw).model_dump()
     new_messages = [
@@ -934,6 +1101,7 @@ def node_run_brief(state: PipelineState) -> Dict[str, Any]:
 
 def node_run_memory_summary(state: PipelineState) -> Dict[str, Any]:
     svc = _get_services()
+    tracker: TokenTracker = state.get("tracker")
     messages = state.get("messages", [])
 
     if len(messages) < 2:
@@ -958,6 +1126,9 @@ def node_run_memory_summary(state: PipelineState) -> Dict[str, Any]:
         temperature=0.2,
         max_tokens=200,
     )
+    if tracker and response.usage:
+        tracker.record("run_memory_summary", svc.settings.summary_model, response.usage)
+
     new_summary = response.choices[0].message.content.strip()
     delete_msgs = [RemoveMessage(id=m.id) for m in messages[:-2]]
     return {"brief_summary": new_summary, "messages": delete_msgs}
@@ -966,6 +1137,7 @@ def node_run_memory_summary(state: PipelineState) -> Dict[str, Any]:
 def node_run_queries(state: PipelineState) -> Dict[str, Any]:
     svc = _get_services()
     payload = state["payload"]
+    tracker: TokenTracker = state.get("tracker")
 
     raw = _llm_call(
         svc.openai_client,
@@ -978,6 +1150,8 @@ def node_run_queries(state: PipelineState) -> Dict[str, Any]:
             category=payload["category"],
             content_brief=json.dumps(state["brief"], indent=2),
         ),
+        tracker=tracker,
+        node_name="run_queries",
     )
     queries = QueryGenerationResponse.model_validate(raw).model_dump()["queries"]
     return {"queries": queries}
@@ -985,11 +1159,16 @@ def node_run_queries(state: PipelineState) -> Dict[str, Any]:
 
 def node_run_retrieval(state: PipelineState) -> Dict[str, Any]:
     svc = _get_services()
+    tracker: TokenTracker = state.get("tracker")
 
     all_chunks: List[Dict[str, Any]] = []
     for q in state["queries"]:
         vector = _embed_text(
-            svc.openai_client, svc.settings.embedding_model, q["query"]
+            svc.openai_client,
+            svc.settings.embedding_model,
+            q["query"],
+            tracker=tracker,
+            node_name=f"retrieval:{q['query_type']}",
         )
         result = svc.pinecone_index.query(
             namespace=svc.settings.pinecone_namespace,
@@ -1014,6 +1193,7 @@ def node_run_chunk_selection(state: PipelineState) -> Dict[str, Any]:
 def node_run_angle_selection(state: PipelineState) -> Dict[str, Any]:
     svc = _get_services()
     payload = state["payload"]
+    tracker: TokenTracker = state.get("tracker")
 
     raw = _llm_call(
         svc.openai_client,
@@ -1026,6 +1206,8 @@ def node_run_angle_selection(state: PipelineState) -> Dict[str, Any]:
             content_brief=json.dumps(state["brief"], indent=2),
             selected_knowledge=json.dumps(state["selected_chunks"], indent=2),
         ),
+        tracker=tracker,
+        node_name="run_angle_selection",
     )
     angle_selection = AngleSelectionResponse.model_validate(raw).model_dump()
     return {"angle_selection": angle_selection}
@@ -1034,6 +1216,7 @@ def node_run_angle_selection(state: PipelineState) -> Dict[str, Any]:
 def node_run_final_content(state: PipelineState) -> Dict[str, Any]:
     svc = _get_services()
     payload = state["payload"]
+    tracker: TokenTracker = state.get("tracker")
 
     raw = _llm_call(
         svc.openai_client,
@@ -1051,6 +1234,8 @@ def node_run_final_content(state: PipelineState) -> Dict[str, Any]:
             selected_chunks_json=json.dumps(state["selected_chunks"], indent=2),
             chosen_angle_json=json.dumps(state["angle_selection"], indent=2),
         ),
+        tracker=tracker,
+        node_name="run_final_content",
     )
     final_content = FinalContentResponse.model_validate(raw).model_dump()
     return {"final_content": final_content}
@@ -1108,7 +1293,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Cricket Psychology RAG API",
-    version="3.0.0",
+    version="3.1.0",
     description="LangGraph 7-node RAG pipeline for cricket psychology content generation.",
     lifespan=lifespan,
 )
@@ -1128,6 +1313,8 @@ def generate_content(payload: GenerateContentRequest):
     try:
         svc: AppState = app.state.services
         config = {"configurable": {"thread_id": payload.thread_id}}
+        tracker = TokenTracker()
+        t_start = time.monotonic()
 
         initial_state: PipelineState = {
             "payload": payload.model_dump(),
@@ -1139,9 +1326,11 @@ def generate_content(payload: GenerateContentRequest):
             "selected_chunks": None,
             "angle_selection": None,
             "final_content": None,
+            "tracker": tracker,
         }
 
         result = svc.graph.invoke(initial_state, config=config)
+        tracker.elapsed_seconds = time.monotonic() - t_start
 
         response_data: Dict[str, Any] = {
             "status": "success",
@@ -1158,7 +1347,9 @@ def generate_content(payload: GenerateContentRequest):
                 "brief_summary_used": result.get("brief_summary", ""),
             })
 
-        return HTMLResponse(content=_render_html(response_data, payload.model_dump()))
+        return HTMLResponse(
+            content=_render_html(response_data, payload.model_dump(), tracker=tracker)
+        )
 
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
