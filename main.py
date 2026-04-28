@@ -145,8 +145,8 @@ class Settings(BaseModel):
             brief_model=os.getenv("BRIEF_MODEL", "gpt-4.1-mini"),
             query_model=os.getenv("QUERY_MODEL", "gpt-4.1-mini"),
             angle_model=os.getenv("ANGLE_MODEL", "gpt-4.1"),
-            final_model=os.getenv("FINAL_MODEL", "gpt-4.1"),
-            summary_model=os.getenv("SUMMARY_MODEL", "gpt-4.1-mini"),
+            final_model=os.getenv("FINAL_MODEL", "gpt-4.1-mini"),
+            summary_model=os.getenv("SUMMARY_MODEL", "gpt-4o-mini"),
             top_k_per_query=int(os.getenv("TOP_K_PER_QUERY", "5")),
             final_chunk_count=int(os.getenv("FINAL_CHUNK_COUNT", "9")),
         )
